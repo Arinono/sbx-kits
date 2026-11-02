@@ -1,11 +1,34 @@
 [tasks.validate]
-run = "sbx kit validate ."
+run = [
+  "sbx kit validate opencode-claude",
+  "sbx kit validate claude-chrome",
+  "sbx kit validate forgejo",
+]
 
-[tasks.build]
-description = "Builds the kit into a docker image"
+[tasks."build:opencode"]
+description = "Builds the opencode kit into a docker image"
+dir = "opencode-claude"
 run = """
   docker buildx build -f opencode-claude.dockerfile \
   --build-arg OPENCODE_VERSION=2.2.5 \
   --build-arg CLAUDE_VERSION=2.1.316 \
   -t arinono/sbx-opencode-claude:1 .
+"""
+
+[tasks."build:claude-chrome"]
+description = "Builds the claude-chrome kit into a docker image"
+dir = "claude-chrome"
+run = """
+  docker buildx build -f claude-chrome.dockerfile \
+  --build-arg CLAUDE_VERSION=2.1.316 \
+  -t arinono/sbx-claude-chrome:1 .
+"""
+
+[tasks."build:forgejo"]
+description = "Builds the forgejo (fj) mixin overlay into a docker image"
+dir = "forgejo"
+run = """
+  docker buildx build -f forgejo.dockerfile \
+  --build-arg FJ_VERSION=0.7.0 \
+  -t arinono/sbx-forgejo:1 .
 """

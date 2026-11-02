@@ -1,66 +1,22 @@
-# OpenCode v2 + Claude Agent sandbox kit
+# sbx kits
 
-A Docker Sandboxes (`sbx`) v3 workload kit that runs **OpenCode v2** with
-**Claude Code** inside, pre-connected through OpenCode's built-in
-**Claude Agent** provider (OpenCode drives `claude` via the Claude Agent SDK;
-Claude uses OpenCode's tools and permission system).
+Docker Sandboxes (`sbx`) v3 workload kits.
 
-| File | Purpose |
-|---|---|
-| `opencode-claude.yaml` | Kit descriptor: credentials, network policy, volumes, hooks |
-| `opencode-claude.dockerfile` | Image: `docker/sandbox-templates:claude-code` + pinned Claude Code + OpenCode v2 (`@opencode/cli`) |
-
-Pinned versions: OpenCode `2.2.5`, Claude Code `2.1.316` (the provider needs ≥ 2.1.248).
-
-## Credentials
-
-Give `sbx` an Anthropic credential on the host. Inside the sandbox you only ever see sentinels:
+| Kit | What it runs | Credential |
+|---|---|---|
+| [`opencode-claude/`](opencode-claude/README.md) | OpenCode v2 driving Claude Code through its Claude Agent provider (default model: Opus) | API key or claude.ai subscription; proxy-managed, no secret in the sandbox |
+| [`claude-chrome/`](claude-chrome/README.md) | Claude Code with Claude in Chrome (drives the Chrome on your host) | claude.ai subscription only; **the real OAuth token enters the sandbox** |
+| [`forgejo/`](forgejo/README.md) | *Mixin*: `fj` (forgejo-cli) and git-over-HTTPS access to one private Forgejo instance, set with `--kit-arg forgejo.host=…` | Forgejo access token (`sbx secret set forgejo`); proxy-managed, no secret in the sandbox |
 
 ```bash
-sbx secret set anthropic -t "sk-ant-..."   # API key
-# or log in with your claude.ai subscription (OAuth) using sbx's anthropic login flow
+sbx run /path/to/sbx-kits/opencode-claude .
+sbx run /path/to/sbx-kits/claude-chrome .
+
+# either workload, plus Forgejo access
+sbx run /path/to/sbx-kits/opencode-claude \
+  --kit /path/to/sbx-kits/forgejo --kit-arg forgejo.host=git.example.com .
 ```
 
-- **OAuth / subscription**: rendered into `~/.claude/.credentials.json`, which `claude` reads.
-- **API key**: an install hook writes `providers.claude-agent.settings.apiKey` into
-  `~/.config/opencode/opencode.json`. This is needed because the provider launches
-  `claude` with `settingSources: []`, which ignores `apiKeyHelper`.
-- **None**: run `claude auth login` in a sandbox shell, then `/connect` → *Claude Agent*.
-
-## Run
-
-```bash
-cd /path/to/your/project
-sbx kit validate /path/to/sbx-template          # optional
-sbx run /path/to/sbx-template .                 # builds the kit and opens OpenCode
-```
-
-In OpenCode, open `/models` and pick a **Claude Agent** model. The list fills in
-after the provider's first probe of `claude`.
-
-Override versions at create time:
-
-```bash
-sbx run /path/to/sbx-template --kit-arg opencodeVersion=2.2.6 --kit-arg claudeVersion=2.1.320 .
-```
-
-## Plain image (no kit)
-
-```bash
-docker buildx build -f opencode-claude.dockerfile \
-  --build-arg OPENCODE_VERSION=2.2.5 --build-arg CLAUDE_VERSION=2.1.316 \
-  -t opencode-claude:latest .
-```
-
-Note that the credential wiring above lives in the kit descriptor. The bare image
-only gets it when it runs as a kit.
-
-## Notes
-
-- OpenCode starts with `--auto`, which auto-approves permissions that are not
-  explicitly denied. The sandbox is the boundary, the same way the Claude kit runs
-  `--dangerously-skip-permissions`.
-- `~/.local/share/opencode` (sessions, integration state) and `~/.claude/projects`
-  (the SDK transcripts behind them) are volumes.
-- Check Anthropic's terms before routing a claude.ai *subscription* through a
-  third-party tool. An API key has no such ambiguity.
+`mise run validate` validates all kits. `mise run build:opencode`,
+`mise run build:claude-chrome` and `mise run build:forgejo` build the plain
+images.

@@ -144,6 +144,9 @@ capabilities:
             set -e
             cfg=/home/agent/.config/opencode/opencode.json
             [ -f "$cfg" ] || echo '{}' > "$cfg"
+            # Default to Claude Agent's Opus alias (Opus 5.5 on the pinned
+            # claude); `//=` keeps a model the user has already set.
+            jq '.model //= "claude-agent/opus"' "$cfg" > "$cfg.tmp" && mv "$cfg.tmp" "$cfg"
             if [ "${SBX_CRED_ANTHROPIC_MODE:-none}" = apikey ]; then
               jq '.providers["claude-agent"].settings.apiKey = "proxy-managed"' "$cfg" > "$cfg.tmp"
             else

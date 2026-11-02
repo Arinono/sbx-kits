@@ -1,0 +1,193 @@
+# syntax=docker/sandbox-kit:3
+# Claude Code with Claude in Chrome: the agent drives the Chrome
+# extension on the host through Anthropic's relay
+# (wss://bridge.claudeusercontent.com) for visual reviews and browsing.
+#
+# TRADE-OFF: the relay authenticates claude with the claude.ai OAuth token
+# sent inside the WebSocket's first message, where the sbx proxy cannot
+# swap a sentinel for the real token (tested: sentinel -> "OAuth token
+# rejected (401)"). So this kit sets oauth.passthrough: the REAL
+# subscription token is handed to the sandbox. Anything running in the
+# sandbox, the model included, can read it. Use the opencode kit when you
+# don't need the browser.
+schemaVersion: "3"
+displayName: Claude Code + Claude in Chrome
+description: >-
+  Claude Code with the Claude in Chrome integration, paired with the
+  extension on the host via Anthropic's relay. claude.ai subscription only;
+  the real OAuth token enters the sandbox.
+sourceUrl: https://github.com/anthropics/claude-code
+
+kind: workload
+
+args:
+  version:
+    # Relay-based Claude in Chrome (pairing across machines) is present
+    # in 2.1.316.
+    default: "2.1.316"
+    pattern: '^[0-9]+\.[0-9]+\.[0-9]+$'
+    description: Claude Code release to install
+    buildArg: CLAUDE_VERSION
+  model:
+    default: "opus"
+    pattern: '^[A-Za-z0-9._\[\]-]*$'
+    description: Claude model (settings.json `model`); empty keeps the CLI default
+    env: CLAUDE_MODEL
+
+provides: ["claude@${{ kit.args.version }}"]
+
+capabilities:
+  - type: com.docker.sandbox/sbx@1
+
+  - type: com.docker.sandbox/network-policy@1
+    config:
+      runtime:
+        allow:
+          - api.anthropic.com:443
+          - platform.claude.com:443
+          - claude.com:443
+          - claude.ai:443
+          - downloads.claude.ai:443
+          - mcp-proxy.anthropic.com:443
+          # Claude in Chrome relay, and /remote-control.
+          - bridge.claudeusercontent.com:443
+
+  # Subscription OAuth only: no apiKey block, so an Anthropic API key bound
+  # on the host is never used by this kit. passthrough: true is the
+  # deliberate downgrade described at the top of this file; the host still
+  # owns sign-in, sbx just stops masking the token.
+  - type: com.docker.sandbox/credential@1
+    name: claude.ai subscription
+    optional: true
+    description: claude.ai subscription (OAuth); real token passed into the sandbox for Claude in Chrome
+    config:
+      service: anthropic
+      phase: runtime
+      oauth:
+        tokenEndpoint: {host: platform.claude.com, path: /v1/oauth/token}
+        resourceHosts: [api.anthropic.com, mcp-proxy.anthropic.com]
+        passthrough: true
+        sentinels:
+          accessToken: sk-ant-oat01-proxy-managed
+          refreshToken: sk-ant-ort01-proxy-managed
+        credentialFile:
+          path: ~/.claude/.credentials.json
+          structure:
+            claudeAiOauth:
+              accessToken: "{{.AccessToken}}"
+              refreshToken: "{{.RefreshToken}}"
+              expiresAt: "{{.ExpiresAt}}"
+              scopes: "{{.Scopes}}"
+
+  - type: com.docker.sandbox/agent-sessions@1
+    description: Drive claude sessions programmatically
+    config:
+      prompt: ["-p", "--", "{{.Prompt}}"]
+      continue: ["--continue"]
+      resume: ["--resume", "{{.SessionID}}"]
+
+  - type: com.docker.sandbox/agent-interactive-sessions@1
+    optional: true
+    config:
+      prompt: ["--", "{{.Prompt}}"]
+      continue: ["--continue"]
+      resume: ["--resume", "{{.SessionID}}"]
+      sessionPicker: ["--resume"]
+
+  - type: com.docker.sandbox/volume@1
+    description: Conversation history
+    config: {path: /home/agent/.claude/projects, size: 2g}
+  - type: com.docker.sandbox/volume@1
+    description: Per-session state; needed for `claude -c`
+    config: {path: /home/agent/.claude/sessions, size: 512m}
+  - type: com.docker.sandbox/volume@1
+    description: TodoWrite state
+    config: {path: /home/agent/.claude/todos, size: 512m}
+
+  - type: com.docker.sandbox/lifecycle@1
+    config:
+      install:
+        - command: mkdir -p /home/agent/.claude && chown agent:agent /home/agent/.claude
+          user: "0"
+          description: Ensure ~/.claude is agent-owned
+
+        # Onboarding/trust flags, plus Claude in Chrome on by default with
+        # its onboarding marked done. Merged with jq so a paired browser
+        # (chromeExtension.pairedDeviceId) survives a re-run.
+        - command: |
+            set -e
+            f=/home/agent/.claude.json
+            [ -s "$f" ] && jq -e . "$f" > /dev/null 2>&1 || echo '{}' > "$f"
+            jq --arg ws "${WORKSPACE_DIR:-/}" '
+              .bypassPermissionsModeAccepted = true
+              | .hasCompletedOnboarding = true
+              | .hasSeenAutoDefaultNudge = true
+              | .claudeInChromeDefaultEnabled = true
+              | .hasCompletedClaudeInChromeOnboarding = true
+              | .projects["/"].hasTrustDialogAccepted = true
+              | .projects[$ws].hasTrustDialogAccepted = true
+            ' "$f" > "$f.tmp"
+            mv "$f.tmp" "$f"
+            chown agent:agent "$f"
+          user: "0"
+          env: [WORKSPACE_DIR]
+          description: Seed Claude onboarding/trust and Claude in Chrome flags
+
+        # No apiKeyHelper: it would take precedence over the subscription
+        # OAuth, and the relay needs the OAuth token.
+        - command: |
+            set -e
+            jq -n --arg model '${{ kit.args.model }}' '
+              {
+                permissions: { defaultMode: "bypassPermissions" },
+                bypassPermissionsModeAccepted: true,
+                skipDangerousModePermissionPrompt: true
+              }
+              + (if $model == "" then {} else { model: $model } end)
+            ' > /home/agent/.claude/settings.json
+          user: agent
+          description: Seed Claude settings.json
+
+        - command: &register-mcp-gateway |
+            [ -n "$MCP_GATEWAY_URL" ] || exit 0
+            export PATH="$HOME/.local/bin:$PATH"
+            claude mcp add mcp-gateway "$MCP_GATEWAY_URL" \
+              --transport http --scope user \
+              --header "Authorization: Bearer $MCP_SENTINEL_TOKEN_NAME" > /dev/null 2>&1 || true
+          user: agent
+          env: [MCP_GATEWAY_URL, MCP_SENTINEL_TOKEN_NAME]
+          description: Register the sandbox MCP gateway
+
+      startup:
+        - command: [sh, -c, "chown -R agent:agent /home/agent/.claude/projects /home/agent/.claude/sessions /home/agent/.claude/todos 2>/dev/null || true"]
+          user: "0"
+          description: Re-own volume mount roots to agent
+        - command: *register-mcp-gateway
+          user: agent
+          env: [MCP_GATEWAY_URL, MCP_SENTINEL_TOKEN_NAME]
+          description: Register the sandbox MCP gateway (startup fallback)
+
+  - type: com.docker.sandbox/agent-skills@1
+    optional: true
+    config:
+      path: /home/agent/.claude/skills
+
+  - type: com.docker.sandbox/agent-context@1
+    optional: true
+    config:
+      filename: CLAUDE.md
+      directory: /home/agent/.claude
+      content: |
+        # Claude in Chrome sandbox
+
+        Claude in Chrome is enabled. The browser is NOT in this sandbox: it is
+        the user's own Chrome on their host machine, reached through
+        Anthropic's relay. Use the `mcp__claude-in-chrome__*` tools to open,
+        inspect and screenshot pages for visual review.
+
+        - A dev server running in this sandbox is not reachable from that
+          browser unless the user published its port (`sbx ports <sandbox>
+          --publish <port>`); then the browser opens http://localhost:<port>.
+        - If the tools report the extension is not connected, ask the user to
+          check that Chrome is open, the extension is installed and signed in
+          to the same claude.ai account, then run `/chrome` to reconnect.

@@ -1,0 +1,111 @@
+# syntax=docker/sandbox-kit:3
+# Forgejo CLI (`fj`, forgejo-cli) as a MIXIN, wired to one private Forgejo
+# instance whose host is a create-time kit arg. The access token stays on
+# the host: the sandbox only sees a sentinel, and the sbx proxy writes the
+# real token into the Authorization header of every request to that host
+# (fj's API calls and git over HTTPS alike).
+#
+#   sbx secret set forgejo        # paste a Forgejo access token
+#   sbx run ./opencode-claude --kit ./forgejo \
+#     --kit-arg forgejo.host=git.example.com .
+schemaVersion: "3"
+displayName: Forgejo CLI (fj)
+description: >-
+  forgejo-cli (`fj`) plus git-over-HTTPS access to one private Forgejo
+  instance, with a proxy-managed access token. Set the instance with
+  --kit-arg forgejo.host=<host>.
+sourceUrl: https://codeberg.org/forgejo-contrib/forgejo-cli
+licenses: [Apache-2.0, MIT]
+
+kind: mixin
+
+args:
+  version:
+    default: "0.7.0"
+    pattern: '^[0-9]+\.[0-9]+\.[0-9]+$'
+    description: forgejo-cli release to build (crates.io)
+    buildArg: FJ_VERSION
+  host:
+    # Bare host name of the instance, served over HTTPS on 443: the
+    # instance URL is https://<host>. Lowercase only, because fj keys its
+    # logins by the URL-normalized (lowercased) host. The pattern also
+    # keeps the value safe to expand into the hook scripts below.
+    required: true
+    pattern: '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'
+    description: Forgejo instance host name, e.g. git.example.com (URL is https://<host>)
+    env: FORGEJO_HOST
+
+provides: ["fj@${{ kit.args.version }}"]
+
+capabilities:
+  - type: com.docker.sandbox/network-policy@1
+    config:
+      runtime:
+        allow:
+          # API (/api/v1), web and git smart HTTP all live on this host.
+          - "${{ kit.args.host }}:443"
+
+  # Forgejo accepts `Authorization: token <t>` on the API and on git smart
+  # HTTP routes, so one header rule covers fj and plain git. The proxy
+  # overwrites whatever header the client sends, so fj's sentinel token
+  # below is replaced too.
+  - type: com.docker.sandbox/credential@1
+    optional: true
+    description: Forgejo access token for ${{ kit.args.host }}
+    config:
+      service: forgejo
+      phase: runtime
+      apiKey:
+        name: FORGEJO_TOKEN
+        proxyManaged: true
+        inject:
+          - {domain: "${{ kit.args.host }}", header: Authorization, format: "token %s"}
+
+  - type: com.docker.sandbox/lifecycle@1
+    config:
+      startup:
+        # Register the instance in fj's key store with the sentinel, so fj
+        # treats it as logged in (some commands refuse to run anonymously)
+        # and sends a header the proxy then swaps for the real token. Only
+        # when the credential is bound: an unbound sentinel would turn
+        # anonymous reads into 401s. Runs at startup because a runtime
+        # credential's sentinel isn't visible to install hooks.
+        - command: |
+            [ -n "$FORGEJO_TOKEN" ] || exit 0
+            command -v jq > /dev/null 2>&1 || { echo "forgejo kit: jq not found, skipping fj login" >&2; exit 0; }
+            set -e
+            d=/home/agent/.local/share/forgejo-cli
+            f="$d/keys.json"
+            mkdir -p "$d"
+            [ -s "$f" ] && jq -e . "$f" > /dev/null 2>&1 || echo '{"hosts":{}}' > "$f"
+            jq --arg host '${{ kit.args.host }}' --arg token "$FORGEJO_TOKEN" '
+              .hosts[$host] = { type: "Application", token: $token }
+            ' "$f" > "$f.tmp"
+            mv "$f.tmp" "$f"
+            chmod 0600 "$f"
+          user: agent
+          env: [FORGEJO_TOKEN]
+          description: Log fj in to the Forgejo instance with the proxy-managed token
+
+  - type: com.docker.sandbox/agent-context@1
+    optional: true
+    config:
+      content: |
+        # Forgejo (${{ kit.args.host }})
+
+        `fj` (forgejo-cli) is on PATH and targets the private Forgejo instance
+        https://${{ kit.args.host }} (also in `$FORGEJO_HOST`).
+
+        - Authentication is proxy-managed: `FORGEJO_TOKEN` and the token in fj's
+          key store are sentinels, and the real token is injected on requests to
+          ${{ kit.args.host }}. Never print or copy the token; it isn't the real
+          value anyway. Do not run `fj auth login` or `fj auth add-key`.
+        - Inside a clone whose remote points at ${{ kit.args.host }}, fj infers the
+          repository: `fj pr create`, `fj pr view <n>`, `fj issue search`,
+          `fj repo view`. Elsewhere pass the repo as `owner/name`, e.g.
+          `fj repo view owner/name`, or use `fj -H ${{ kit.args.host }} ...`.
+        - Git over HTTPS works without a credential helper:
+          `git clone https://${{ kit.args.host }}/owner/name.git`. SSH remotes are
+          not reachable from this sandbox; use HTTPS URLs.
+        - Run `fj --help` / `fj <command> --help` for anything else; `fj whoami`
+          checks that authentication works.
