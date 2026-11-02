@@ -1,0 +1,227 @@
+# syntax=docker/sandbox-kit:3
+# OpenCode v2 as a WORKLOAD whose model connection is Claude Code: the
+# claude-code sandbox template with opencode v2 added, OpenCode's built-in
+# "Claude Agent" provider pre-connected, and the Anthropic credential
+# (API key or claude.ai subscription OAuth) wired the way claude expects.
+schemaVersion: "3"
+displayName: OpenCode v2 + Claude Agent
+description: >-
+  OpenCode v2 with Claude Code inside, pre-connected through OpenCode's
+  Claude Agent provider. Uses a proxy-managed Anthropic API key or your
+  claude.ai subscription; no secret ever enters the sandbox.
+sourceUrl: https://github.com/anomalyco/opencode
+
+kind: workload
+
+args:
+  opencodeVersion:
+    default: "2.2.5"
+    pattern: '^2\.[0-9]+\.[0-9]+$'
+    description: OpenCode v2 release to install (@opencode/cli)
+    buildArg: OPENCODE_VERSION
+  claudeVersion:
+    # The Claude Agent provider needs 2.1.248+, and 2.1.257+ for
+    # context-window discovery.
+    default: "2.1.316"
+    pattern: '^[0-9]+\.[0-9]+\.[0-9]+$'
+    description: Claude Code release to install
+    buildArg: CLAUDE_VERSION
+
+provides:
+  - "opencode@${{ kit.args.opencodeVersion }}"
+  - "claude@${{ kit.args.claudeVersion }}"
+
+capabilities:
+  - type: com.docker.sandbox/sbx@1
+
+  - type: com.docker.sandbox/network-policy@1
+    config:
+      runtime:
+        allow:
+          # Claude Code: API, OAuth token refresh, claude auth login,
+          # updates and the MCP proxy.
+          - api.anthropic.com:443
+          - platform.claude.com:443
+          - claude.com:443
+          - claude.ai:443
+          - downloads.claude.ai:443
+          - mcp-proxy.anthropic.com:443
+          # OpenCode: config schema, model catalog, npm for MCP servers
+          # and plugins, GitHub release assets for LSP auto-install.
+          - opencode.ai:443
+          - "*.opencode.ai:443"
+          - models.dev:443
+          - registry.npmjs.org:443
+          - github.com:443
+          - api.github.com:443
+          - codeload.github.com:443
+          - "*.githubusercontent.com:443"
+          # The template's apt mirrors (a workload owns its base).
+          - archive.ubuntu.com:80
+          - security.ubuntu.com:80
+          - ports.ubuntu.com:80
+
+  # Same shape as the claude kit: whichever the host has bound. No
+  # proxyManaged on apiKey, because a planted ANTHROPIC_API_KEY sentinel
+  # would override the subscription OAuth in claude. API-key mode is
+  # handed to the provider through opencode.json instead (install hook).
+  - type: com.docker.sandbox/credential@1
+    name: Anthropic access
+    optional: true
+    description: Anthropic API key or claude.ai subscription (OAuth)
+    config:
+      service: anthropic
+      phase: runtime
+      apiKey:
+        name: ANTHROPIC_API_KEY
+        inject:
+          - {domain: api.anthropic.com, header: x-api-key, format: "%s"}
+          - {domain: mcp-proxy.anthropic.com, header: x-api-key, format: "%s"}
+      oauth:
+        tokenEndpoint: {host: platform.claude.com, path: /v1/oauth/token}
+        sentinels:
+          accessToken: sk-ant-oat01-proxy-managed
+          refreshToken: sk-ant-ort01-proxy-managed
+        credentialFile:
+          path: ~/.claude/.credentials.json
+          structure:
+            claudeAiOauth:
+              accessToken: "{{.AccessToken}}"
+              refreshToken: "{{.RefreshToken}}"
+              expiresAt: "{{.ExpiresAt}}"
+              scopes: "{{.Scopes}}"
+            primaryApiKey: "{{.PrimaryApiKey}}"
+
+  # OpenCode's database (sessions, the connected integration, the cached
+  # Claude model list) and the Claude Agent SDK transcripts it resumes.
+  - type: com.docker.sandbox/volume@1
+    description: OpenCode sessions and state
+    config: {path: /home/agent/.local/share/opencode, size: 2g}
+  - type: com.docker.sandbox/volume@1
+    description: Claude Agent SDK transcripts behind OpenCode sessions
+    config: {path: /home/agent/.claude/projects, size: 2g}
+
+  - type: com.docker.sandbox/lifecycle@1
+    config:
+      install:
+        # Volumes and the skills mount create their parents root-owned
+        # when the image does not ship them; hand them back to agent.
+        - command: |
+            set -e
+            mkdir -p /home/agent/.claude /home/agent/.config/opencode /home/agent/.local/share/opencode
+            chown agent:agent /home/agent/.claude /home/agent/.claude/projects \
+              /home/agent/.config /home/agent/.config/opencode \
+              /home/agent/.local/share/opencode
+          user: "0"
+          description: Ensure claude/opencode config dirs are agent-owned
+
+        # For running `claude` directly in a shell: skip onboarding and the
+        # trust dialog. The SDK path opencode uses ignores this file.
+        - command: |
+            set -e
+            ws="${WORKSPACE_DIR:-/}"
+            esc=$(printf '%s' "$ws" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/\\t/g; s/\r/\\r/g')
+            projects="\"/\": { \"hasTrustDialogAccepted\": true }"
+            [ "$ws" = "/" ] || projects="$projects, \"$esc\": { \"hasTrustDialogAccepted\": true }"
+            printf '%s\n' "{
+              \"bypassPermissionsModeAccepted\": true,
+              \"hasCompletedOnboarding\": true,
+              \"hasSeenAutoDefaultNudge\": true,
+              \"projects\": { $projects }
+            }" > /home/agent/.claude.json
+            chown agent:agent /home/agent/.claude.json
+          user: "0"
+          env: [WORKSPACE_DIR]
+          description: Seed Claude onboarding/trust flags
+
+        # The Claude Agent provider launches claude with settingSources: [],
+        # so settings.json's apiKeyHelper never reaches it. In API-key mode
+        # give the provider the sentinel through its own settings (mapped to
+        # ANTHROPIC_API_KEY for the claude child; the proxy swaps in the
+        # real key). In OAuth mode leave it out so claude uses the rendered
+        # ~/.claude/.credentials.json. Merged with jq so user settings stay.
+        - command: |
+            set -e
+            cfg=/home/agent/.config/opencode/opencode.json
+            [ -f "$cfg" ] || echo '{}' > "$cfg"
+            if [ "${SBX_CRED_ANTHROPIC_MODE:-none}" = apikey ]; then
+              jq '.providers["claude-agent"].settings.apiKey = "proxy-managed"' "$cfg" > "$cfg.tmp"
+            else
+              jq 'del(.providers["claude-agent"].settings.apiKey)' "$cfg" > "$cfg.tmp"
+            fi
+            mv "$cfg.tmp" "$cfg"
+
+            # Same for a bare `claude` in the shell.
+            if [ "${SBX_CRED_ANTHROPIC_MODE:-none}" = apikey ]; then
+              printf '%s\n' '{ "apiKeyHelper": "echo proxy-managed", "permissions": { "defaultMode": "bypassPermissions" }, "skipDangerousModePermissionPrompt": true }' > /home/agent/.claude/settings.json
+            else
+              printf '%s\n' '{ "permissions": { "defaultMode": "bypassPermissions" }, "skipDangerousModePermissionPrompt": true }' > /home/agent/.claude/settings.json
+            fi
+          user: agent
+          env: [SBX_CRED_ANTHROPIC_MODE]
+          description: Hand the Anthropic auth mode to OpenCode's Claude Agent provider
+
+      startup:
+        - command: [sh, -c, "chown -R agent:agent /home/agent/.local/share/opencode /home/agent/.claude/projects 2>/dev/null || true"]
+          user: "0"
+          description: Re-own volume mount roots to agent
+
+        # Connect the Claude Agent integration so its models show up in
+        # /models without a trip through /connect. Idempotent; the state
+        # lives in the opencode volume, so it is done at startup rather
+        # than baked into the image.
+        - command: |
+            export PATH="$HOME/.local/bin:$PATH"
+            opencode auth login claude-agent --standalone < /dev/null > /dev/null 2>&1 || true
+          user: agent
+          env: [HTTP_PROXY, HTTPS_PROXY, NO_PROXY, OPENCODE_CLAUDE_PATH]
+          description: Connect OpenCode's Claude Agent provider
+
+        - command: |
+            [ -n "$MCP_GATEWAY_URL" ] || exit 0
+            opencode mcp add mcp-gateway --global --url "$MCP_GATEWAY_URL" \
+              --header "Authorization=Bearer $MCP_SENTINEL_TOKEN_NAME" > /dev/null 2>&1 || true
+          user: agent
+          env: [MCP_GATEWAY_URL, MCP_SENTINEL_TOKEN_NAME]
+          description: Register the sandbox MCP gateway with OpenCode
+
+  - type: com.docker.sandbox/agent-sessions@1
+    config:
+      # `--` keeps a prompt starting with `-` from parsing as a flag.
+      prompt: ["run", "--", "{{.Prompt}}"]
+
+  - type: com.docker.sandbox/agent-interactive-sessions@1
+    optional: true
+    config:
+      prompt: ["--prompt={{.Prompt}}"]
+      continue: ["--continue"]
+      resume: ["--session", "{{.SessionID}}"]
+
+  - type: com.docker.sandbox/acp@1
+    optional: true
+    description: Drive opencode sessions over the Agent Client Protocol
+    config:
+      agent: opencode
+      command: [opencode, acp]
+
+  - type: com.docker.sandbox/agent-skills@1
+    optional: true
+    config:
+      path: /home/agent/.config/opencode/skills
+
+  - type: com.docker.sandbox/agent-context@1
+    optional: true
+    config:
+      filename: AGENTS.md
+      directory: /home/agent/.config/opencode
+      content: |
+        # OpenCode + Claude Agent sandbox
+
+        This sandbox runs OpenCode v2. Its model provider is "Claude Agent":
+        OpenCode drives Claude Code (`claude`, at $OPENCODE_CLAUDE_PATH) through
+        the Claude Agent SDK, and Claude uses OpenCode's tools.
+
+        Anthropic credentials are proxy-managed: the API key or claude.ai OAuth
+        tokens visible inside the sandbox are sentinels the proxy replaces.
+        If Claude Agent reports it is not logged in, run `claude auth login`
+        in a shell, then reconnect with `/connect` -> Claude Agent.

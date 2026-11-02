@@ -1,0 +1,11 @@
+[tasks.validate]
+run = "sbx kit validate ."
+
+[tasks.build]
+description = "Builds the kit into a docker image"
+run = """
+  docker buildx build -f opencode-claude.dockerfile \
+  --build-arg OPENCODE_VERSION=2.2.5 \
+  --build-arg CLAUDE_VERSION=2.1.316 \
+  -t arinono/sbx-opencode-claude:1 .
+"""
